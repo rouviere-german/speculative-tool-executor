@@ -1,0 +1,4 @@
+{
+  "min": {"tool_wait_reduction": 0.20, "coverage": 0.50, "hit_ratio": 0.25},
+  "max": {"waste_ratio": 0.10, "external_speculations": 0, "divergent_tasks": 0}
+}
