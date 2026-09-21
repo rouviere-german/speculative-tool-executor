@@ -1,0 +1,33 @@
+# Local stack. Only locally built images; nothing is pulled at runtime besides the pinned bases.
+services:
+  app:
+    build:
+      context: .
+    image: speculative-tool-executor:local
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_LOG_LEVEL: INFO
+      # Comma-separated SHA-256 digests; generate with `uv run speculative-tool-executor generate-api-key`.
+      APP_API_KEY_SHA256: ${APP_API_KEY_SHA256:-}
+      # Leave unset to stay offline: nothing the service serves needs a model.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # The speculation kill switch and per-tool overrides. Set APP_SPECULATION_ENABLED=false to
+      # stop all speculation without rebuilding, or list tool names to narrow it.
+      APP_SPECULATION_ENABLED: ${APP_SPECULATION_ENABLED:-true}
+      APP_SPECULATION_DISABLED_TOOLS: ${APP_SPECULATION_DISABLED_TOOLS:-}
+      APP_SPECULATION_TOP_K: ${APP_SPECULATION_TOP_K:-2}
+      APP_SPECULATION_BUDGET_USD: ${APP_SPECULATION_BUDGET_USD:-0.5}
+      APP_SPECULATION_MAX_WASTE_RATIO: ${APP_SPECULATION_MAX_WASTE_RATIO:-0.10}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    restart: unless-stopped
