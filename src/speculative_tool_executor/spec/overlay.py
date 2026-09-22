@@ -66,13 +66,18 @@ class WriteOverlay:
             raise OverlayError(f"branch {self.branch_id} is {self._state.value}")
 
     def read(self, key: str) -> str | None:
-        """Read through the buffer. The first read of a key pins the version commit re-checks."""
+        """Read through the buffer. The first read of a key pins the version commit re-checks.
+
+        A key the branch already wrote is served from the buffer, but the dependency is still
+        recorded: a branch that *looked* at a key must depend on it whichever order it touched
+        it in. Without that, write-then-read would be a blind write and could silently clobber
+        another party's value -- the exact failure optimistic concurrency control is here for.
+        """
         self._require_open()
+        entry = self.store.get(key)
+        self.observe(key, None if entry is None else entry.version)
         if key in self._writes:
             return self._writes[key]
-        entry = self.store.get(key)
-        if key not in self._reads:
-            self._reads[key] = None if entry is None else entry.version
         return None if entry is None else entry.value
 
     def write(self, key: str, value: str) -> None:
@@ -88,7 +93,11 @@ class WriteOverlay:
         self._writes[key] = None
 
     def observe(self, key: str, version: int | None) -> None:
-        """Record a version dependency that was not established through :meth:`read`."""
+        """Record that this branch depends on ``key`` being at ``version`` at commit time.
+
+        :meth:`read` calls this for every key it touches. It is also the way a handler that
+        learned a version by some other route pins it, which is why it is public.
+        """
         self._require_open()
         self._reads.setdefault(key, version)
 

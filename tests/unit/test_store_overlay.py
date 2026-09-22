@@ -244,6 +244,46 @@ def test_validate_reports_conflicts_without_committing(store: VersionedStore) ->
     assert overlay.state is BranchState.OPEN
 
 
+def test_reading_back_a_buffered_write_still_pins_the_underlying_version(
+    store: VersionedStore,
+) -> None:
+    """Touching a key in either order must make the branch depend on it.
+
+    Write-then-read is the trap: the value comes out of the buffer, so it is tempting not to
+    record anything. That would turn the branch into a blind write, and optimistic concurrency
+    control would let it clobber whatever another party stored in the meantime -- in the one
+    module whose entire job is catching exactly that.
+    """
+    store.put("a", "original")
+    overlay = WriteOverlay(store=store, branch_id="b1")
+    overlay.write("a", "branch-value")
+    assert overlay.read("a") == "branch-value", "the branch sees its own write"
+    assert "a" in overlay.read_set
+
+    store.put("a", "written-by-another-party")
+    result = overlay.commit()
+    assert result.committed is False
+    assert result.conflicts == ("a",)
+
+    entry = store.get("a")
+    assert entry is not None
+    assert entry.value == "written-by-another-party"
+
+
+def test_a_write_that_never_reads_the_key_stays_a_blind_write(store: VersionedStore) -> None:
+    """The dependency comes from observing the key, not from writing it."""
+    store.put("a", "original")
+    overlay = WriteOverlay(store=store, branch_id="b1")
+    overlay.write("a", "branch-value")
+    assert overlay.read_set == {}
+
+    store.put("a", "written-by-another-party")
+    assert overlay.commit().committed is True
+    entry = store.get("a")
+    assert entry is not None
+    assert entry.value == "branch-value"
+
+
 def test_observe_records_a_dependency_established_elsewhere(store: VersionedStore) -> None:
     """A handler that learned a version by another route can still pin it."""
     version = store.put("a", "1")
