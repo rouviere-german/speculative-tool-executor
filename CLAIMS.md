@@ -20,7 +20,7 @@ results, so a reader can disagree with the assumptions rather than the arithmeti
 
 | # | Claim | Kind | Evidence |
 |---|---|---|---|
-| P1 | Speculation reduces end-to-end p50 by 8.8% and p95 by 5.4% on 300 tasks | Measurement | `bench/bench_speculation.py`, `.github/workflows/ci.yml#bench` |
+| P1 | Speculation reduces end-to-end p50 by 8.8% and p95 by 5.4% on 300 tasks | Measurement + Gate | `bench/bench_speculation.py`, floors (0.05 / 0.02) enforced in `bench/speculation_thresholds.json` by `.github/workflows/ci.yml#bench`; `tests/unit/test_bench_thresholds.py::test_losing_the_end_to_end_gain_fails_the_gate_even_if_tool_wait_holds` |
 | P2 | Speculation removes 34.6% of total tool wait | Measurement | `bench/bench_speculation.py`, floor enforced in `bench/speculation_thresholds.json` |
 | P3 | 75% of speculatable calls are served from a speculative branch (coverage) | Measurement | `bench/bench_speculation.py`, floor enforced by `--check` |
 | P4 | Hit ratio is 0.41 at top-k 2 | Measurement | `bench/bench_speculation.py` |
@@ -43,6 +43,7 @@ results, so a reader can disagree with the assumptions rather than the arithmeti
 | C3 | The cost model is benefit vs waste in one unit, with the exchange rate configurable | Invariant | `tests/unit/test_controller.py::test_speculation_is_allowed_when_expected_benefit_beats_expected_waste` |
 | C4 | Speculation that is not worth it is refused with the arithmetic recorded | Invariant | `tests/unit/test_controller.py::test_a_call_that_is_not_worth_it_is_refused_with_the_arithmetic_attached` |
 | C5 | top-k counts launches, not guesses, so a refused candidate cannot suppress a usable one | Invariant | `tests/unit/test_speculator.py::test_top_k_counts_launches_not_guesses` |
+| C6 | A hit is credited to the tool that produced it, including a reused `PURE` result claimed a second time | Invariant | `tests/unit/test_speculator.py::test_a_hit_is_credited_to_the_tool_that_produced_it` |
 
 ## Correctness claims
 
@@ -66,7 +67,7 @@ results, so a reader can disagree with the assumptions rather than the arithmeti
 | X16 | Rescaling for the sweep moves the model turn and nothing else | Invariant | `tests/unit/test_latency.py::test_rescaling_moves_the_model_turn_and_leaves_the_tools_alone` |
 | X17 | Predicted arguments are derived from the previous output, so they generalise to unseen data | Invariant | `tests/unit/test_cache_predictor_taint.py::test_arguments_are_derived_from_the_previous_output_not_memorised` |
 | X18 | A derivation that no longer resolves is dropped, never guessed | Invariant | `tests/unit/test_cache_predictor_taint.py::test_a_template_whose_path_no_longer_resolves_is_dropped_not_guessed` |
-| X19 | A speculative READ or WRITE result is single-use; a PURE one is not | Invariant | `tests/unit/test_cache_predictor_taint.py::test_read_and_write_results_are_single_use_but_pure_results_are_not` |
+| X19 | A speculative READ or WRITE result is single-use; a PURE one is reusable because it carries no branch, and can be claimed twice | Invariant | `tests/unit/test_cache_predictor_taint.py::test_read_and_write_results_are_single_use_but_pure_results_are_not`, `tests/unit/test_cache_predictor_taint.py::test_a_reusable_result_cannot_be_built_with_a_branch_attached`, `tests/unit/test_speculator.py::test_a_pure_speculation_can_be_claimed_twice_without_exploding` |
 | X20 | Every evaluation task's reference calls validate against the real tool schemas | Invariant | `tests/unit/test_workload.py::test_every_reference_call_validates_against_the_real_tool_schema` |
 | X21 | Every speculatable step is fully derivable from the previous output | Invariant | `tests/unit/test_workload.py::test_every_speculatable_step_is_fully_derivable_from_the_previous_output` |
 | X22 | Predictor training tasks are disjoint from the evaluation tasks | Invariant | `tests/unit/test_workload.py::test_training_tasks_are_disjoint_from_the_evaluation_tasks` |
@@ -76,6 +77,13 @@ results, so a reader can disagree with the assumptions rather than the arithmeti
 | X26 | Disabling speculation reproduces the baseline exactly | Invariant | `tests/integration/test_speculation.py::test_disabling_speculation_reproduces_the_baseline_exactly` |
 | X27 | Every ablation stays equivalent to the non-speculative run | Invariant + Measurement | `tests/integration/test_speculation.py::test_every_ablation_stays_equivalent_to_the_non_speculative_run`; `bench/bench_speculation.py` |
 | X28 | A failing tool is recorded as data, not raised as a crash | Invariant | `tests/integration/test_speculation.py::test_a_failing_tool_is_data_not_a_crash` |
+| X29 | A direct read-modify-write that loses an OCC race retries on top of the other party's value | Invariant | `tests/integration/test_direct_path.py::test_a_direct_write_retries_on_top_of_the_other_party_s_value` |
+| X30 | When the retries run out the call fails with `CommitConflict` and the other party's write survives | Invariant | `tests/integration/test_direct_path.py::test_a_direct_write_that_runs_out_of_retries_fails_instead_of_losing_the_update` |
+| X31 | A speculation whose handler raised is discarded and the call runs for real | Invariant | `tests/integration/test_direct_path.py::test_a_speculation_that_failed_is_discarded_and_the_call_runs_for_real` |
+| X32 | A claimed branch that was already settled is never committed again or served | Invariant | `tests/integration/test_direct_path.py::test_a_claimed_branch_that_was_already_settled_is_never_served` |
+| X33 | A branch that writes a key and then reads it still depends on that key's version | Invariant | `tests/unit/test_store_overlay.py::test_reading_back_a_buffered_write_still_pins_the_underlying_version` |
+| X34 | The registry refuses a canonicalizer whose output fails the schema or is not a fixed point of the args model | Invariant | `tests/unit/test_tools.py::test_a_canonicalizer_whose_output_fails_the_schema_is_refused`, `tests/unit/test_tools.py::test_a_canonicalizer_whose_output_is_not_a_fixed_point_is_refused` |
+| X35 | `tally_items` ignores order but not repetition, so a repeated item is a different call | Invariant | `tests/unit/test_canonicalize.py::test_a_tally_keeps_multiplicity_out_of_its_equivalence_class` |
 
 ## Security claims
 
@@ -88,7 +96,7 @@ Each maps to a row of `docs/THREAT_MODEL.md`.
 | S3 | The external handler itself refuses a speculative branch | Invariant | `tests/integration/test_security_controls.py::test_the_external_handler_itself_refuses_a_speculative_branch` |
 | S4 | No external effect occurs from a mispredicted run | Invariant | `tests/integration/test_security_controls.py::test_no_external_effect_occurs_from_a_mispredicted_run` |
 | S5 | 0 external speculations across the 300-task benchmark, enforced as a hard ceiling | Measurement + Gate | `bench/bench_speculation.py`, `.github/workflows/ci.yml#bench` |
-| S6 | A tool cannot be registered without declaring an effect class | Invariant | `tests/unit/test_tools.py::test_a_tool_cannot_be_defined_without_an_effect_class` |
+| S6 | A tool cannot be registered without declaring an effect class | Invariant | `tests/unit/test_tools.py::test_a_tool_cannot_be_defined_without_an_effect_class`, `tests/unit/test_tools.py::test_an_effect_that_is_not_an_effect_class_is_refused_at_definition`, `tests/unit/test_tools.py::test_registration_re_checks_the_effect_of_a_tool_assembled_behind_the_constructor` |
 | S7 | An effect constrains which capabilities a tool may hold | Invariant | `tests/unit/test_tools.py::test_effect_constrains_which_capabilities_a_tool_may_hold` |
 | S8 | A capability with irreversible reach cannot opt out of approval | Invariant | `tests/unit/test_tools.py::test_irreversible_capabilities_cannot_opt_out_of_approval` |
 | S9 | A non-pure tool must bound how long a speculative result stays usable | Invariant | `tests/unit/test_tools.py::test_non_pure_tools_must_bound_how_long_a_speculative_result_lives` |
@@ -98,7 +106,7 @@ Each maps to a row of `docs/THREAT_MODEL.md`.
 | S13 | The requester cannot approve its own call | Invariant | `tests/integration/test_security_controls.py::test_the_requester_cannot_approve_its_own_call` |
 | S14 | A gullible model obeying an injection still sends nothing | Invariant | `tests/integration/test_security_controls.py::test_a_gullible_model_obeying_an_injection_still_sends_nothing` |
 | S15 | Hostile tool output cannot forge or escape an untrusted-data envelope | Invariant | `tests/integration/test_security_controls.py::test_tool_output_is_wrapped_as_untrusted_data_that_cannot_forge_an_envelope` |
-| S16 | A prediction naming something the model never saw is refused | Invariant | `tests/integration/test_security_controls.py::test_a_prediction_naming_something_the_model_never_saw_is_refused` |
+| S16 | A prediction naming something the model never saw is refused, and one too large to finish checking is refused too (the bound fails closed) | Invariant | `tests/integration/test_security_controls.py::test_a_prediction_naming_something_the_model_never_saw_is_refused`, `tests/unit/test_cache_predictor_taint.py::test_an_argument_too_large_to_walk_is_refused_rather_than_waved_through` |
 | S17 | Schema constants are usable without having been uttered; nothing else is | Invariant | `tests/unit/test_cache_predictor_taint.py::test_schema_constants_are_allowed_without_having_been_uttered` |
 | S18 | Read tools are jailed to the workspace | Invariant | `tests/integration/test_security_controls.py::test_read_tools_are_jailed_to_the_workspace` |
 | S19 | Canonicalization does not launder a traversal attempt | Invariant | `tests/integration/test_security_controls.py::test_canonicalization_does_not_launder_a_traversal_attempt` |
@@ -110,11 +118,20 @@ Each maps to a row of `docs/THREAT_MODEL.md`.
 | S25 | `APP_SPECULATION_ENABLED=false` stops real speculation end to end | Invariant | `tests/integration/test_speculation_config.py::test_the_configured_kill_switch_stops_real_speculation` |
 | S26 | `APP_SPECULATION_DISABLED_TOOLS` stops only the named tools | Invariant | `tests/integration/test_speculation_config.py::test_a_configured_per_tool_override_stops_only_that_tool` |
 | S27 | Every call is audited with how it was served, in a verifiable chain | Invariant | `tests/integration/test_security_controls.py::test_every_call_is_audited_with_how_it_was_served` |
-| S28 | An edited audit entry is detected | Invariant | `tests/integration/test_security_controls.py::test_the_audit_chain_detects_an_edited_entry` |
+| S28 | An edited audit entry is detected; a truncated log is detected by an open writer or an anchored head, not from the file alone | Invariant | `tests/integration/test_security_controls.py::test_the_audit_chain_detects_an_edited_entry`, `tests/unit/test_audit.py::test_truncation_while_open_is_detected_on_the_next_append`, `tests/unit/test_audit.py::test_tail_truncation_needs_an_anchored_head` |
 | S29 | An args model that masks a field is refused, so nothing escapes the call hash | Invariant | `tests/unit/test_tools.py::test_argument_models_that_do_not_round_trip_are_refused_without_echoing_values` |
 | S30 | The `/v1/speculation` snapshot requires authentication and reports benefit and cost together | Invariant | `tests/integration/test_speculation_config.py::test_the_snapshot_reports_both_benefit_and_cost` |
 | S31 | Speculation is scoped to the run's task group and cannot outlive it | Invariant | `tests/integration/test_speculation.py::test_leaving_the_session_settles_every_outstanding_branch` |
 | S32 | Every speculation refusal has a named, counted reason | Invariant | `tests/unit/test_speculator.py::test_an_argument_the_model_never_saw_is_refused_by_taint` |
+
+## Observability claims
+
+| # | Claim | Kind | Evidence |
+|---|---|---|---|
+| B1 | Spans mark speculative vs authoritative work: one `tool.speculate` span (`speculative=true`) per branch, one `tool.execute` span (`speculative=false`, with `speculation.mode`) per call, linked by `call.hash` | Invariant | `tests/unit/test_speculator.py::test_speculative_and_authoritative_work_are_separate_spans`, `tests/unit/test_speculator.py::test_a_call_no_branch_matched_is_marked_direct_in_its_span` |
+| B2 | A cancelled branch still ends its span, marked `cancelled` | Invariant | `tests/unit/test_speculator.py::test_a_cancelled_branch_still_closes_its_span` |
+| B3 | The demo checks its own trace live, and that check can fail | Invariant | `tests/integration/test_demos_cli.py::test_the_demo_span_check_passes_only_on_a_faithful_trace` |
+| B4 | `speculation_occ_conflicts_total` counts a speculative branch whose read version moved, and nothing else a branch is discarded for | Invariant | `tests/integration/test_direct_path.py::test_a_stale_speculative_read_is_counted_as_exactly_one_occ_conflict`, `tests/integration/test_direct_path.py::test_a_speculation_that_failed_is_discarded_and_the_call_runs_for_real` |
 
 ## Offline and reproducibility claims
 
@@ -139,7 +156,7 @@ Each maps to a row of `docs/THREAT_MODEL.md`.
 | G5 | `semgrep` enforces the repo rules, including "every tool declares an effect" and "EXTERNAL is never speculatable" | Gate | `.github/workflows/ci.yml#semgrep`, `.semgrep/rules.yml` |
 | G6 | Secrets scanning runs on every push | Gate | `.github/workflows/ci.yml#gitleaks` |
 | G7 | The container is linted, built, smoke-tested, scanned, and an SBOM is produced | Gate | `.github/workflows/ci.yml#docker` |
-| G8 | Benchmark thresholds are enforced, not merely reported | Gate | `.github/workflows/ci.yml#bench` |
+| G8 | Benchmark thresholds are enforced, not merely reported, including floors on the end-to-end p50 and p95 reductions | Gate | `.github/workflows/ci.yml#bench`, `tests/unit/test_bench_thresholds.py::test_the_measured_headline_passes_the_gate` |
 | G9 | The shared baseline (files, README sections, hardening, evidence links) is checked | Gate | `.github/workflows/ci.yml#baseline`, `scripts/check_baseline.py` |
 | G10 | No pickle-family serialization anywhere in the package | Gate | `scripts/check_baseline.py`, `tests/unit/test_no_pickle.py::test_source_tree_has_no_pickle_family_serialization` |
 

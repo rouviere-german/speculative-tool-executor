@@ -71,4 +71,4 @@ All latencies are **simulated** on a virtual clock from the lognormal distributi
 | threshold-0.00 | 3.7066 | 0.0809 | 0.3905 | 525 | 0.0156 | True |
 | threshold-0.35 | 3.8776 | 0.0385 | 0.7619 | 168 | 0.0027 | True |
 
-Benchmark wall-clock runtime: 69.8s.
+Benchmark wall-clock runtime: 72.7s.

@@ -71,8 +71,8 @@ The load-bearing pieces, in the order they constrain each other:
 | Predictor | `spec/predictor.py` | Back-off n-gram over call signatures; arguments **derived** from the previous output, not memorised. |
 | Taint | `spec/taint.py` | A prediction may only name strings the model has already seen, or constants the schema declares. |
 | Controller | `spec/controller.py` | `p_hit x latency x value-per-second` against `(1-p_hit) x cost`, plus budget, waste trip, kill switch. |
-| Speculator | `spec/speculator.py` | One `TaskGroup` per run; launches, cancels, and bills every branch exactly once. |
-| Executor | `spec/executor.py` | Validate, authorize, match, commit-or-discard, audit. |
+| Speculator | `spec/speculator.py` | One `TaskGroup` per run; launches, cancels, and bills every branch exactly once. One `tool.speculate` span (`speculative=true`) per branch. |
+| Executor | `spec/executor.py` | Validate, authorize, match, commit-or-discard, audit. One `tool.execute` span (`speculative=false`) per call, carrying how it was served. |
 | Virtual clock | `spec/clock.py` | Simulates time inside a real event loop; advances only when every participant is asleep. |
 
 Two design notes that are easy to get wrong:
@@ -104,16 +104,25 @@ runs on Windows too. **Nothing here needs an API key.** The tests, the demo and 
 run entirely offline against a scripted `FakeProvider`; `ANTHROPIC_API_KEY` is only read by the
 optional `AnthropicProvider`, which nothing in the default paths constructs.
 
-The demo prints a per-call waterfall on the virtual clock:
+The demo prints a per-call waterfall on the virtual clock, then a span summary of the same
+task's trace (copied from `uv run python tasks.py demo`; the span counts cover a warm-up run of
+the task plus the run shown):
 
 ```
+  task task-0002 (audit_module), speculation ON
   tool          mode                     wait  saved  timeline
-  ------------- ---------------------- ------ ------  ------------------------------
+  ------------- ---------------------- ------ ------  ------------------------------------------------------
   list_dir      direct                   0.18   0.00                        ===
-  read_file     speculative-committed    0.00   0.16                             #
-  save_note     speculative-committed    0.00   0.20                              #
-  total elapsed 3.49s (model 3.31s, tool wait 0.18s)
+  read_file     speculative-committed    0.00   0.16                                             #
+  save_note     speculative-committed    0.00   0.20                                                 #
+  total elapsed 3.49s (model 3.31s, tool wait 0.18s); '#' = served from a speculative branch, '=' = waited for
+  spans: 6 tool.execute (speculative=false), 8 tool.speculate (speculative=true), 4 calls served from one
 ```
+
+It ends with eight live safety checks, all `[ok]`: identical outputs, identical committed writes,
+a byte-identical store, no external tool speculated, the injected instruction sent nothing, the
+audit chain verifies, a tampered copy is rejected, and the trace marks speculative work apart
+from the authoritative calls that claimed it.
 
 ## Results
 
@@ -123,7 +132,7 @@ are in [BENCHMARKS.md](BENCHMARKS.md), which the benchmark generates; it also wr
 JSON to `bench/results/speculation.json` locally (not committed, since it changes on every run).
 
 Machine: `Windows-10-10.0.19045-SP0`, Python 3.12.14, 6 CPUs. 300 generated tasks, predictor
-trained on 120 disjoint tasks, benchmark wall-clock runtime 65.1s.
+trained on 120 disjoint tasks, benchmark wall-clock runtime 72.7s.
 
 | Metric | Speculation off | Speculation on |
 |---|---:|---:|
@@ -191,7 +200,8 @@ Every control below has a test; see [CLAIMS.md](CLAIMS.md) for the mapping and
 - **Predictions pass the same gates as real calls**, plus two more: the taint rule (only strings
   the model has already seen, or schema constants) and the controller's cost test. A predictor —
   including an LLM drafter, whose output is untrusted by construction — cannot invent a path, a
-  host or a recipient and have it executed.
+  host or a recipient and have it executed. The taint walk is bounded and the bound fails
+  closed: an argument too large to finish checking is refused, so padding is not a bypass.
 - **Injected instructions are contained structurally.** A deliberately gullible fake model that
   obeys a `CALL_TOOL` line planted in tool output still sends nothing: the call stops at the
   approval gate. Containment does not depend on the model resisting.
@@ -202,7 +212,14 @@ Every control below has a test; see [CLAIMS.md](CLAIMS.md) for the mapping and
   waste-ratio trip that disables speculation mid-run; `APP_SPECULATION_ENABLED=false` and
   `APP_SPECULATION_DISABLED_TOOLS` as environment overrides, both tested end to end.
 - **Audit.** One hash-chained entry per call, marked `direct`, `speculative-committed` or
-  `speculative-aborted`, plus launch and abort records. Editing any entry is detected.
+  `speculative-aborted`, plus launch and abort records. Editing any entry is detected. Cutting
+  entries off the *end* is detected by a writer that still has the log open, or by
+  `--expect-head` against a head hash kept elsewhere; a log handed over cold with no anchor can
+  only be shown to be internally consistent (see the threat model's residual risks).
+- **Traces tell guesses from calls.** Each branch is a `tool.speculate` span with
+  `speculative=true`; each authoritative call is a `tool.execute` span with `speculative=false`
+  and `speculation.mode`, linked to the branch that served it by `call.hash`. The demo checks
+  this on its own trace.
 - The service adds API-key auth, rate limiting, body-size limits, explicit CORS origins and PII
   redaction in logs, with `/v1/speculation` exposing hit ratio *and* waste ratio together.
 
@@ -226,6 +243,9 @@ Every control below has a test; see [CLAIMS.md](CLAIMS.md) for the mapping and
   story.
 - **Not a general agent framework.** The agent loop exists to exercise the executor. It is
   single-tool-call-per-turn, scripted from reference trajectories, and deliberately boring.
+- **No trace collector is bundled.** Spans are recorded in-process (`none`) or printed
+  (`console`); shipping them to a collector means adding an OTLP exporter and passing it to
+  `build_tracer_provider`. The tests and the demo read spans from an in-memory exporter.
 - **Containers are configured, not verified here.** `Dockerfile` and `docker-compose.yml` are
   adapted to this project; `gitleaks`, `semgrep`, `trivy`, `syft` and `hadolint` run in CI only.
 
