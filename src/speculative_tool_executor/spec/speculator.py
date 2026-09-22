@@ -340,14 +340,20 @@ class SpeculationSession:
             metrics.hit_ratio.labels(tool=tool).set(controller.per_tool_hit_ratio().get(tool, 0.0))
 
     def record_discard(self, key: str, *, tool: str, cost_usd: float, reason: str) -> None:
-        """A claimed branch failed validation (stale read or write conflict) and was thrown away."""
+        """A claimed branch was thrown away instead of served, for the given ``reason``.
+
+        Only ``occ_conflict`` -- a version the branch read had moved -- counts toward the OCC
+        conflict metric. A branch whose handler raised, or whose branch was already settled, is
+        waste all the same, but it is not evidence of contention and must not read as such.
+        """
         self._forget(key)
         controller = self._deps.controller
         controller.record_miss(tool, cost_usd=cost_usd)
         metrics = self._deps.metrics
         if metrics is not None:
             metrics.wasted_usd_total.inc(cost_usd)
-            metrics.occ_conflicts_total.inc()
+            if reason == "occ_conflict":
+                metrics.occ_conflicts_total.inc()
             metrics.hit_ratio.labels(tool=tool).set(controller.per_tool_hit_ratio().get(tool, 0.0))
         self._audit(
             "speculation.discarded",
