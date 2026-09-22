@@ -34,6 +34,8 @@ from speculative_tool_executor.core.canonical import canonical_json
 __all__ = ["TaintReport", "TaintTracker", "schema_constants"]
 
 _MAX_VALUE_LENGTH = 4096
+_MAX_WALK_NODES = 8192
+_MAX_SCHEMA_NODES = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +61,7 @@ def schema_constants(schema: Mapping[str, JsonValue]) -> frozenset[str]:
     found: set[str] = set()
     stack: list[JsonValue] = [dict(schema)]
     seen_nodes = 0
-    while stack and seen_nodes < 4096:
+    while stack and seen_nodes < _MAX_SCHEMA_NODES:
         node = stack.pop()
         seen_nodes += 1
         if isinstance(node, list):
@@ -107,7 +109,7 @@ class TaintTracker:
         """Record every string reachable in ``value`` (and, for text, its whitespace tokens)."""
         stack: list[JsonValue] = [value]
         visited = 0
-        while stack and visited < 8192:
+        while stack and visited < _MAX_WALK_NODES:
             current = stack.pop()
             visited += 1
             if isinstance(current, dict):
@@ -140,9 +142,18 @@ class TaintTracker:
         return TaintReport(fields=tuple(offending))
 
     def _violations(self, value: JsonValue, constants: frozenset[str]) -> bool:
+        """Whether ``value`` contains a string the model has not seen and no schema declares.
+
+        The walk is bounded so a pathological argument cannot stall the speculator, and the
+        bound fails **closed**: an argument too large to finish checking is reported as a
+        violation. Anything else would make padding the argument until the budget runs out the
+        cheapest way to get an arbitrary string past the rule.
+        """
         stack: list[JsonValue] = [value]
         visited = 0
-        while stack and visited < 8192:
+        while stack:
+            if visited >= _MAX_WALK_NODES:
+                return True
             current = stack.pop()
             visited += 1
             if isinstance(current, dict):

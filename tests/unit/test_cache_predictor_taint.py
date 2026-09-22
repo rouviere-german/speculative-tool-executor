@@ -354,6 +354,34 @@ def test_the_tracker_is_bounded_and_evicts_oldest_first() -> None:
         TaintTracker(max_values=0)
 
 
+def test_an_argument_too_large_to_walk_is_refused_rather_than_waved_through() -> None:
+    """The walk is bounded, so the bound has to fail *closed*.
+
+    A tainted value hidden past the node budget must still refuse the prediction; otherwise the
+    cheapest bypass of the whole rule is to pad the argument until the walk gives up.
+    """
+    tracker = TaintTracker()
+    tracker.observe("harmless")
+
+    wide: dict[str, JsonValue] = {"items": ["NEVER-UTTERED", *["harmless"] * 9000]}
+    assert tracker.check(wide).ok is False, "a wide argument must not launder an unseen value"
+
+    deep: JsonValue = "NEVER-UTTERED"
+    for _ in range(9000):
+        deep = {"next": deep}
+    assert tracker.check({"nested": deep}).ok is False, "depth must not launder it either"
+
+
+def test_a_large_argument_of_only_seen_values_is_still_refused_not_guessed() -> None:
+    """Fail-closed means refusing what it could not finish checking, even when it was fine."""
+    tracker = TaintTracker()
+    tracker.observe("harmless")
+    big: dict[str, JsonValue] = {"items": ["harmless"] * 9000}
+    small: dict[str, JsonValue] = {"items": ["harmless"] * 3}
+    assert tracker.check(big).ok is False
+    assert tracker.check(small).ok is True
+
+
 @given(values=st.lists(st.text(min_size=1, max_size=12), min_size=1, max_size=10))
 def test_everything_observed_is_seen(values: list[str]) -> None:
     tracker = TaintTracker()
