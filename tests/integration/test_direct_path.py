@@ -296,3 +296,38 @@ async def test_a_claimed_branch_that_was_already_settled_is_never_served(tmp_pat
         assert any('"reason":"branch_settled"' in line for line in lines)
     finally:
         harness.close()
+
+
+async def test_a_stale_speculative_read_is_counted_as_exactly_one_occ_conflict() -> None:
+    """The positive half of the metric's contract: a version that moved *is* a conflict.
+
+    A ``get_note`` speculation reads the key; another party then writes it before the model asks
+    for the same call. The branch is discarded, the call re-executes and sees the new value, and
+    the conflict counter moves by one -- the only discard reason that may move it.
+    """
+    note = "notes/auth.migration"
+    harness = Harness(
+        Prediction(tool="get_note", arguments={"key": note}, probability=0.9, source="fixed"),
+        seen=(note,),
+    )
+    try:
+        harness.store.put(note, "first draft")
+        with harness.clock.participant():
+            async with harness.executor.session() as session:
+                session.start_turn(PredictionContext(history=("list_dir(path)",)))
+                await harness.clock.sleep(5.0)
+                assert len(harness.executor.cache) == 1, "the guess must have finished"
+                harness.store.put(note, "rewritten by another party")
+
+                outcome = await harness.executor.execute(
+                    ToolUseBlock(id="call-1", name="get_note", arguments={"key": note}),
+                    session=session,
+                )
+
+        assert outcome.mode == ExecutionMode.SPECULATIVE_ABORTED
+        assert outcome.conflicts == (note,)
+        assert "rewritten by another party" in str(outcome.output)
+        assert _counter(harness, "app_speculation_occ_conflicts_total") == 1.0
+        assert harness.controller.stats.occ_conflicts == 1
+    finally:
+        harness.close()
