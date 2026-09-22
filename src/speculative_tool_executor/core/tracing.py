@@ -19,7 +19,7 @@ from opentelemetry.sdk.trace.export import (
     SpanExporter,
 )
 
-__all__ = ["build_tracer_provider", "install_global_tracer_provider"]
+__all__ = ["build_tracer_provider", "get_tracer", "install_global_tracer_provider"]
 
 _installed: list[TracerProvider] = []
 
@@ -46,3 +46,12 @@ def install_global_tracer_provider(provider: TracerProvider) -> bool:
     trace.set_tracer_provider(provider)
     _installed.append(provider)
     return True
+
+
+def get_tracer(name: str) -> trace.Tracer:
+    """The tracer for ``name`` from whatever provider is installed globally.
+
+    Components take their tracer as a constructor argument defaulting to this, so a test can
+    hand in one backed by an in-memory exporter without touching global state.
+    """
+    return trace.get_tracer(name)

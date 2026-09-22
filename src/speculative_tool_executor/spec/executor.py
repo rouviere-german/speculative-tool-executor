@@ -29,6 +29,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
+from opentelemetry.trace import Tracer
 from pydantic import JsonValue
 
 from speculative_tool_executor.agentic.approval import ApprovalGate
@@ -38,6 +39,7 @@ from speculative_tool_executor.agentic.providers.base import ToolUseBlock
 from speculative_tool_executor.agentic.tools import ToolRegistry, ValidatedCall
 from speculative_tool_executor.core.canonical import canonical_json, sha256_hex
 from speculative_tool_executor.core.logging import get_logger
+from speculative_tool_executor.core.tracing import get_tracer
 from speculative_tool_executor.spec.cache import SpeculativeCache, SpeculativeResult
 from speculative_tool_executor.spec.clock import Clock
 from speculative_tool_executor.spec.controller import SpeculationController
@@ -57,6 +59,7 @@ from speculative_tool_executor.spec.taint import TaintTracker
 __all__ = ["ExecutionMode", "SpeculativeToolExecutor", "ToolOutcome", "unusable_reason"]
 
 _log = get_logger("speculative_tool_executor.executor")
+_TRACER_NAME = "speculative_tool_executor.spec"
 
 
 class ExecutionMode:
@@ -108,6 +111,7 @@ class SpeculativeToolExecutor:
         metrics: SpeculationMetrics | None = None,
         principal: str = "agent",
         max_commit_retries: int = 3,
+        tracer: Tracer | None = None,
     ) -> None:
         if max_commit_retries < 1:
             raise ValueError("max_commit_retries must be at least 1")
@@ -123,6 +127,7 @@ class SpeculativeToolExecutor:
         self._metrics = metrics
         self._principal = principal
         self._max_commit_retries = max_commit_retries
+        self._tracer = tracer or get_tracer(_TRACER_NAME)
         self._runner = ToolRunner(store=store, clock=clock, latency=latency)
         self._direct_branches = itertools.count()
 
@@ -167,6 +172,7 @@ class SpeculativeToolExecutor:
             metrics=self._metrics,
             audit=self._audit,
             principal=self._principal,
+            tracer=self._tracer,
         )
         async with asyncio.TaskGroup() as group:
             session = SpeculationSession(deps, group=group, clock=self._clock)
@@ -178,7 +184,23 @@ class SpeculativeToolExecutor:
                     self._metrics.enabled.set(1.0 if self._controller.enabled else 0.0)
 
     async def execute(self, call: ToolUseBlock, *, session: SpeculationSession) -> ToolOutcome:
-        """Execute one call the model actually made, using a matching branch when one exists."""
+        """Execute one call the model actually made, using a matching branch when one exists.
+
+        The whole call is one span marked ``speculative=False``: this is the authoritative path,
+        whatever served it. ``speculation.mode`` then says which of the three ways it was served,
+        so a trace shows at a glance which calls speculation actually removed the wait from.
+        """
+        with self._tracer.start_as_current_span("tool.execute") as span:
+            span.set_attribute("speculative", False)
+            span.set_attribute("tool.name", call.name)
+            outcome = await self._execute(call, session=session)
+            span.set_attribute("tool.effect", outcome.effect.value)
+            span.set_attribute("speculation.mode", outcome.mode)
+            span.set_attribute("call.hash", outcome.call_hash)
+            span.set_attribute("latency_saved_seconds", outcome.latency_saved_seconds)
+            return outcome
+
+    async def _execute(self, call: ToolUseBlock, *, session: SpeculationSession) -> ToolOutcome:
         validated = self._registry.validate_call(call)
         # The model has answered this turn, so predicting for it can only create waste.
         session.settle_turn()

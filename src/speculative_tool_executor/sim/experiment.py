@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
+from opentelemetry.trace import Tracer
 
 from speculative_tool_executor.agentic.approval import ApprovalGate, ApprovalStore
 from speculative_tool_executor.sim.agent import (
@@ -177,8 +178,13 @@ def build_arm(
     *,
     corpus: Corpus | None = None,
     training_count: int = 120,
+    tracer: Tracer | None = None,
 ) -> Arm:
-    """Instantiate a scenario with its own store, clock, registry and executor."""
+    """Instantiate a scenario with its own store, clock, registry and executor.
+
+    ``tracer`` defaults to the globally installed one (a no-op unless something installed a
+    provider); the demo passes a recording tracer to check its spans live.
+    """
     workspace = corpus if corpus is not None else build_corpus()
     store = VersionedStore(":memory:", synchronous="OFF")
     registry, sink = build_registry(workspace, canonicalize=scenario.canonicalize)
@@ -196,6 +202,7 @@ def build_arm(
         predictor=build_predictor(scenario, corpus=workspace, training_count=training_count),
         cache=SpeculativeCache(max_entries=64),
         taint=TaintTracker(),
+        tracer=tracer,
     )
     agent = SimulatedAgent(
         executor=executor,

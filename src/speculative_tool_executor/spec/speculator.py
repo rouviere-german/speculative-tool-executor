@@ -27,6 +27,7 @@ import itertools
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from opentelemetry.trace import Tracer
 from pydantic import JsonValue
 
 from speculative_tool_executor.agentic.audit import AuditLog
@@ -35,6 +36,7 @@ from speculative_tool_executor.agentic.errors import ToolArgumentError, ToolNotA
 from speculative_tool_executor.agentic.providers.base import ToolUseBlock
 from speculative_tool_executor.agentic.tools import ToolRegistry, ValidatedCall
 from speculative_tool_executor.core.logging import get_logger
+from speculative_tool_executor.core.tracing import get_tracer
 from speculative_tool_executor.spec.cache import (
     SpeculativeCache,
     SpeculativeResult,
@@ -84,6 +86,7 @@ class SpeculationDeps:
     metrics: SpeculationMetrics | None = None
     audit: AuditLog | None = None
     principal: str = "agent"
+    tracer: Tracer = field(default_factory=lambda: get_tracer("speculative_tool_executor.spec"))
 
 
 @dataclass(slots=True)
@@ -271,15 +274,31 @@ class SpeculationSession:
             return None
 
     async def _run(self, launched: LaunchedSpeculation, validated: ValidatedCall) -> None:
-        """The speculative branch itself. Cancellation is expected here, not exceptional."""
-        with self._clock.participant():
+        """The speculative branch itself. Cancellation is expected here, not exceptional.
+
+        The branch gets its own span marked ``speculative=True``, so work the model never asked
+        for is distinguishable in a trace from the authoritative call that may later claim it.
+        A cancelled branch ends its span on the way out like any other.
+        """
+        with (
+            self._clock.participant(),
+            self._deps.tracer.start_as_current_span("tool.speculate") as span,
+        ):
+            span.set_attribute("speculative", True)
+            span.set_attribute("tool.name", validated.tool.name)
+            span.set_attribute("tool.effect", validated.tool.effect.value)
+            span.set_attribute("call.hash", launched.key)
+            span.set_attribute("speculation.branch", launched.branch_id)
+            span.set_attribute("speculation.probability", launched.prediction.probability)
             try:
                 outcome = await self._deps.runner.run(
                     validated, branch_id=launched.branch_id, speculative=True
                 )
             except asyncio.CancelledError:
+                span.set_attribute("speculation.outcome", "cancelled")
                 launched.done.set()
                 raise
+            span.set_attribute("speculation.outcome", outcome.outcome)
             tool = validated.tool
             # A PURE handler touches no store state, and its cache entry is *reusable*: the same
             # result object is handed to every matching call. Carrying the branch into the cache

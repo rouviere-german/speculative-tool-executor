@@ -9,12 +9,13 @@ from typing import Any
 
 import pytest
 from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from speculative_tool_executor import cli
 from speculative_tool_executor.agentic.audit import AuditLog
 from speculative_tool_executor.core import tracing
 from speculative_tool_executor.core.security import hash_api_key
-from speculative_tool_executor.sim.demo import run_speculation_demo
+from speculative_tool_executor.sim.demo import run_speculation_demo, span_summary
 
 pytestmark = pytest.mark.integration
 
@@ -36,6 +37,54 @@ def test_demo_is_offline_equivalent_and_contains_the_injection(tmp_path: Path) -
     assert summary["audit_ok"] is True
     assert summary["tampered_copy_detected"] is True
     assert summary["all_checks_passed"] is True
+
+    # Spans: authoritative and speculative work are told apart in the trace itself.
+    spans = summary["spans"]
+    assert isinstance(spans, dict)
+    assert spans["consistent"] is True
+    assert isinstance(spans["speculative_spans"], int)
+    assert spans["speculative_spans"] > 0
+    assert isinstance(spans["calls_served_from_speculation"], int)
+    assert spans["calls_served_from_speculation"] >= 1
+
+
+def _spans(*spans: tuple[str, dict[str, Any]]) -> InMemorySpanExporter:
+    exporter = InMemorySpanExporter()
+    provider = tracing.build_tracer_provider("span-check", extra_exporter=exporter)
+    tracer = provider.get_tracer("t")
+    for name, attributes in spans:
+        with tracer.start_as_current_span(name) as span:
+            for key, value in attributes.items():
+                span.set_attribute(key, value)
+    return exporter
+
+
+def test_the_demo_span_check_passes_only_on_a_faithful_trace() -> None:
+    """The live check has to be able to fail, or it is decoration."""
+    guess = ("tool.speculate", {"speculative": True, "call.hash": "h1"})
+    served = (
+        "tool.execute",
+        {"speculative": False, "speculation.mode": "speculative-committed", "call.hash": "h1"},
+    )
+    direct = ("tool.execute", {"speculative": False, "speculation.mode": "direct"})
+
+    good = span_summary(_spans(guess, served, direct), min_authoritative=2)
+    assert good == {
+        "authoritative_spans": 2,
+        "speculative_spans": 1,
+        "calls_served_from_speculation": 1,
+        "consistent": True,
+    }
+
+    unexplained = (
+        "tool.execute",
+        {"speculative": False, "speculation.mode": "speculative-committed", "call.hash": "h2"},
+    )
+    assert span_summary(_spans(guess, unexplained), min_authoritative=1)["consistent"] is False
+    mislabelled = ("tool.speculate", {"speculative": False, "call.hash": "h1"})
+    assert span_summary(_spans(mislabelled, served), min_authoritative=1)["consistent"] is False
+    assert span_summary(_spans(guess, served), min_authoritative=2)["consistent"] is False
+    assert span_summary(_spans(direct), min_authoritative=1)["consistent"] is False
 
 
 def test_demo_is_rerunnable_from_a_dirty_workdir(tmp_path: Path) -> None:

@@ -11,10 +11,13 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import Tracer
 
 from speculative_tool_executor.agentic.approval import ApprovalGate, ApprovalStore
 from speculative_tool_executor.agentic.audit import AuditLog
 from speculative_tool_executor.agentic.providers.base import ToolUseBlock
+from speculative_tool_executor.core.tracing import build_tracer_provider
 from speculative_tool_executor.spec.cache import SpeculativeCache
 from speculative_tool_executor.spec.clock import VirtualClock
 from speculative_tool_executor.spec.controller import (
@@ -76,6 +79,7 @@ class Harness:
         policy: SpeculationPolicy | None = None,
         audit: AuditLog | None = None,
         seen: tuple[str, ...] = (),
+        tracer: Tracer | None = None,
     ) -> None:
         self.store = VersionedStore(":memory:", synchronous="OFF")
         self.registry, self.sink = build_registry(CORPUS)
@@ -101,6 +105,7 @@ class Harness:
             taint=self.taint,
             audit=audit,
             metrics=self.metrics,
+            tracer=tracer,
         )
 
     def close(self) -> None:
@@ -409,5 +414,88 @@ async def test_a_hit_is_credited_to_the_tool_that_produced_it() -> None:
                 await harness.executor.execute(call, session=session)
         assert harness.controller.tool_stats("outline_text").hits == 2
         assert harness.controller.tool_stats("unknown").hits == 0
+    finally:
+        harness.close()
+
+
+# -- spans: which work the model asked for, and which it did not ---------------------------------
+
+
+def _recording_tracer() -> tuple[Tracer, InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = build_tracer_provider("spec-test", extra_exporter=exporter)
+    return provider.get_tracer("test"), exporter
+
+
+async def test_speculative_and_authoritative_work_are_separate_spans() -> None:
+    """The spec asks for spans that mark speculative versus authoritative work; this is them."""
+    tracer, exporter = _recording_tracer()
+    harness = Harness(prediction("read_file", {"path": FIRST_ENTRY}), tracer=tracer)
+    call = ToolUseBlock(id="t1", name="read_file", arguments={"path": FIRST_ENTRY})
+    try:
+        with harness.clock.participant():
+            async with harness.executor.session() as session:
+                session.start_turn(
+                    PredictionContext(history=("list_dir(path)",), last_output=LISTING)
+                )
+                await harness.clock.sleep(5.0)
+                outcome = await harness.executor.execute(call, session=session)
+        assert outcome.mode == "speculative-committed"
+
+        spans = {span.name: dict(span.attributes or {}) for span in exporter.get_finished_spans()}
+        assert set(spans) == {"tool.speculate", "tool.execute"}
+
+        guess = spans["tool.speculate"]
+        assert guess["speculative"] is True
+        assert guess["tool.name"] == "read_file"
+        assert guess["tool.effect"] == "read"
+        assert guess["speculation.outcome"] == "ok"
+        assert str(guess["speculation.branch"]).startswith("spec:read_file:")
+
+        real = spans["tool.execute"]
+        assert real["speculative"] is False
+        assert real["speculation.mode"] == "speculative-committed"
+        assert real["call.hash"] == guess["call.hash"]
+        assert float(str(real["latency_saved_seconds"])) > 0
+    finally:
+        harness.close()
+
+
+async def test_a_call_no_branch_matched_is_marked_direct_in_its_span() -> None:
+    tracer, exporter = _recording_tracer()
+    harness = Harness(tracer=tracer)
+    call = ToolUseBlock(id="t1", name="read_file", arguments={"path": FIRST_ENTRY})
+    try:
+        with harness.clock.participant():
+            async with harness.executor.session() as session:
+                await harness.executor.execute(call, session=session)
+        spans = [span for span in exporter.get_finished_spans() if span.name == "tool.execute"]
+        assert len(spans) == 1
+        attributes = dict(spans[0].attributes or {})
+        assert attributes["speculative"] is False
+        assert attributes["speculation.mode"] == "direct"
+        assert attributes["latency_saved_seconds"] == 0.0
+    finally:
+        harness.close()
+
+
+async def test_a_cancelled_branch_still_closes_its_span() -> None:
+    """A mispredicted branch is the common case, so its span must not leak."""
+    tracer, exporter = _recording_tracer()
+    harness = Harness(prediction("read_file", {"path": FIRST_ENTRY}), tracer=tracer)
+    other = ToolUseBlock(id="t1", name="list_dir", arguments={"path": "src/auth"})
+    try:
+        with harness.clock.participant():
+            async with harness.executor.session() as session:
+                session.start_turn(
+                    PredictionContext(history=("list_dir(path)",), last_output=LISTING)
+                )
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                assert session.in_flight, "the branch must be running before it is cancelled"
+                await harness.executor.execute(other, session=session)
+        guesses = [span for span in exporter.get_finished_spans() if span.name == "tool.speculate"]
+        assert len(guesses) == 1
+        assert dict(guesses[0].attributes or {})["speculation.outcome"] == "cancelled"
     finally:
         harness.close()

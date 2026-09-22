@@ -8,8 +8,9 @@ It runs the same tasks twice -- speculation off, then on -- and prints three thi
    the time would be advertising;
 3. the **safety checks**, run live rather than asserted in prose: the two arms produced identical
    outputs, identical committed writes and a byte-identical store; no external tool was ever
-   speculated; and a deliberately gullible model following an injected instruction still could not
-   send anything.
+   speculated; a deliberately gullible model following an injected instruction still could not
+   send anything; and the trace of the waterfall task marks speculative work apart from the
+   authoritative calls that claimed it.
 
 Everything is offline and deterministic. No API key is read, no socket is opened, and the audit
 log the run writes is verified (and its tampered copy rejected) before the summary is printed.
@@ -22,6 +23,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import Tracer
 from pydantic import JsonValue
 
 from speculative_tool_executor.agentic.approval import ApprovalGate, ApprovalStore
@@ -31,6 +34,7 @@ from speculative_tool_executor.agentic.providers.fake import (
     FakeProvider,
     GullibleInjectionPolicy,
 )
+from speculative_tool_executor.core.tracing import build_tracer_provider
 from speculative_tool_executor.sim.agent import SimulatedAgent, TaskRun
 from speculative_tool_executor.sim.experiment import Comparison, run_ab
 from speculative_tool_executor.spec.cache import SpeculativeCache
@@ -231,11 +235,21 @@ async def _run(workdir: Path) -> dict[str, JsonValue]:
     tasks = generate_tasks(count=DEMO_TASKS, corpus=corpus, read_bias=DEMO_READ_BIAS)
     comparison = await run_ab(tasks, corpus=corpus, read_bias=DEMO_READ_BIAS, training_count=120)
 
-    example = await _example_run(tasks, corpus)
+    exporter = InMemorySpanExporter()
+    provider = build_tracer_provider("speculative-tool-executor-demo", extra_exporter=exporter)
+    example = await _example_run(tasks, corpus, tracer=provider.get_tracer("demo"))
+    spans = span_summary(exporter, min_authoritative=len(example[1].calls))
+    provider.shutdown()
     print("\nLatency waterfall for one task (virtual clock, simulated latencies)")
     print(f"  task {example[0].task_id} ({example[0].shape}), speculation ON")
     for line in waterfall(example[1]):
         print(line)
+
+    print(
+        f"  spans: {spans['authoritative_spans']} tool.execute (speculative=false), "
+        f"{spans['speculative_spans']} tool.speculate (speculative=true), "
+        f"{spans['calls_served_from_speculation']} calls served from one"
+    )
 
     print("\nCost table (simulated tool costs; tokens priced as claude-sonnet-5)")
     for line in cost_table(comparison):
@@ -268,6 +282,7 @@ async def _run(workdir: Path) -> dict[str, JsonValue]:
         "injected instruction sent nothing": injection["messages_sent"] == 0,
         "audit chain verifies": injection["audit_ok"],
         "tampered audit copy rejected": tamper_detected,
+        "spans mark speculative vs authoritative work": spans["consistent"] is True,
     }
     for label, ok in checks.items():
         print(f"  [{'ok' if ok else 'FAIL'}] {label}")
@@ -290,6 +305,7 @@ async def _run(workdir: Path) -> dict[str, JsonValue]:
             if name.startswith("app_speculation") or name.startswith("app_tool")
         ),
         "all_checks_passed": all(checks.values()),
+        "spans": spans,
         **injection,
         "tampered_copy_detected": tamper_detected,
     }
@@ -299,7 +315,9 @@ def _metric_names(metrics: Any) -> list[str]:
     return [family.name for family in metrics.registry.collect()]
 
 
-async def _example_run(tasks: Sequence[Task], corpus: Any) -> tuple[Task, TaskRun]:
+async def _example_run(
+    tasks: Sequence[Task], corpus: Any, *, tracer: Tracer | None = None
+) -> tuple[Task, TaskRun]:
     """Re-run one representative multi-step task on its own so its waterfall is legible."""
     from speculative_tool_executor.sim.experiment import Scenario, build_arm  # noqa: PLC0415
 
@@ -307,7 +325,9 @@ async def _example_run(tasks: Sequence[Task], corpus: Any) -> tuple[Task, TaskRu
         (task for task in tasks if task.shape == "audit_module" and len(task.calls) == 3),
         tasks[0],
     )
-    arm = build_arm(Scenario(name="demo", top_k=2, read_bias=DEMO_READ_BIAS), corpus=corpus)
+    arm = build_arm(
+        Scenario(name="demo", top_k=2, read_bias=DEMO_READ_BIAS), corpus=corpus, tracer=tracer
+    )
     try:
         # Warm the predictor's context the way a real session would: run the task once to fill
         # the store, then again so the waterfall shows a steady-state run rather than a cold one.
@@ -315,3 +335,35 @@ async def _example_run(tasks: Sequence[Task], corpus: Any) -> tuple[Task, TaskRu
         return chosen, await arm.agent.run(chosen)
     finally:
         arm.close()
+
+
+def span_summary(exporter: InMemorySpanExporter, *, min_authoritative: int) -> dict[str, JsonValue]:
+    """Check, from the finished spans alone, that speculation is visible as speculation.
+
+    Every authoritative call is one ``tool.execute`` span with ``speculative=false``; every
+    branch launched on a guess is one ``tool.speculate`` span with ``speculative=true``; and
+    every call served from a branch names, through ``call.hash``, a speculative span that
+    really ran that call. The exporter holds both runs of the waterfall task (the warm-up and
+    the one printed), so the caller passes the printed run's call count as a lower bound.
+    """
+    finished = [(span.name, dict(span.attributes or {})) for span in exporter.get_finished_spans()]
+    authoritative = [attrs for name, attrs in finished if name == "tool.execute"]
+    speculative = [attrs for name, attrs in finished if name == "tool.speculate"]
+    speculated_hashes = {attrs.get("call.hash") for attrs in speculative}
+    served = [
+        attrs for attrs in authoritative if attrs.get("speculation.mode") == "speculative-committed"
+    ]
+    claimed = sum(1 for attrs in served if attrs.get("call.hash") in speculated_hashes)
+    consistent = (
+        all(attrs.get("speculative") is False for attrs in authoritative)
+        and all(attrs.get("speculative") is True for attrs in speculative)
+        and len(authoritative) >= min_authoritative
+        and claimed == len(served)
+        and len(speculative) > 0
+    )
+    return {
+        "authoritative_spans": len(authoritative),
+        "speculative_spans": len(speculative),
+        "calls_served_from_speculation": claimed,
+        "consistent": consistent,
+    }
