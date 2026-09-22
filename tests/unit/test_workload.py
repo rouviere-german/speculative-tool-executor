@@ -209,12 +209,18 @@ def test_the_realised_shape_mix_matches_the_declared_weights() -> None:
 
 
 def test_every_reference_call_validates_against_the_real_tool_schema() -> None:
+    """The generated trajectories are calls the registry accepts, not a parallel vocabulary."""
     registry, _ = build_registry(CORPUS)
+    checked = 0
     for task in generate_tasks(count=60, corpus=CORPUS):
         for index, call in enumerate(task.calls):
-            registry.validate_call(
+            validated = registry.validate_call(
                 ToolUseBlock(id=f"c{index}", name=call.tool, arguments=dict(call.arguments))
             )
+            assert validated.tool.name == call.tool
+            assert len(validated.call_hash) == 64
+            checked += 1
+    assert checked > 100, "the generator must actually have produced calls to check"
 
 
 def test_every_speculatable_step_is_fully_derivable_from_the_previous_output() -> None:

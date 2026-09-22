@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
+
 import pytest
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import ConsoleSpanExporter
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from speculative_tool_executor.core import tracing
@@ -25,11 +28,24 @@ def test_provider_records_spans_without_global_state() -> None:
     assert resource.attributes["service.name"] == "svc"
 
 
-def test_console_exporter_can_be_selected() -> None:
+def test_console_exporter_can_be_selected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``console`` has to actually print: it is the only exporter this repo ships offline.
+
+    The exporter is redirected to a buffer rather than captured from stdout, because
+    ``ConsoleSpanExporter`` binds ``sys.stdout`` as a default argument at import time and so
+    writes past pytest's capture entirely.
+    """
+    stream = io.StringIO()
+    monkeypatch.setattr(tracing, "ConsoleSpanExporter", lambda: ConsoleSpanExporter(out=stream))
+
     provider = build_tracer_provider("svc", "console")
     with provider.get_tracer("t").start_as_current_span("work"):
         pass
+    assert provider.force_flush() is True
+
+    printed = stream.getvalue()
     provider.shutdown()
+    assert '"name": "work"' in printed
 
 
 def test_global_provider_is_installed_once(monkeypatch: pytest.MonkeyPatch) -> None:

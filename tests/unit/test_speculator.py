@@ -289,6 +289,7 @@ async def test_settle_turn_stops_a_predictor_that_is_still_thinking() -> None:
 
 
 async def test_starting_a_new_turn_settles_the_previous_one() -> None:
+    """A second turn's predictions must not race the first turn's; the first one is settled."""
     harness = Harness(prediction("read_file", {"path": FIRST_ENTRY}))
     try:
         with harness.clock.participant():
@@ -296,10 +297,14 @@ async def test_starting_a_new_turn_settles_the_previous_one() -> None:
                 session.start_turn(
                     PredictionContext(history=("list_dir(path)",), last_output=LISTING)
                 )
+                assert session.stats.turns_cancelled == 0
                 session.start_turn(
                     PredictionContext(history=("list_dir(path)",), last_output=LISTING)
                 )
+                assert session.stats.turns_cancelled == 1, "the first turn was cancelled"
                 await asyncio.sleep(0)
+                assert session.settle_turn() is False, "the second turn already finished"
+                assert session.stats.turns_cancelled == 1
     finally:
         harness.close()
 

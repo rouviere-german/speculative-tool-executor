@@ -1,7 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Annotated, Any
+
 import pytest
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SecretStr,
+    field_serializer,
+)
 
 from speculative_tool_executor.agentic.effects import (
     SPECULATABLE_EFFECTS,
@@ -241,10 +252,13 @@ def test_invalid_arguments_are_rejected_without_echoing_values(
 
 
 def test_valid_calls_are_canonicalized_and_runnable() -> None:
-    validated = make_registry().validate_call(call("echo", text="hi"))
+    registry = make_registry()
+    validated = registry.validate_call(call("echo", text="hi"))
     assert validated.canonical_args == {"text": "hi", "count": 1}
     assert validated.run() == "hi"
     assert validated.call_hash == tool_call_hash("echo", {"count": 1, "text": "hi"})
+    assert validated.effect is Effect.PURE, "the effect travels with the validated call"
+    assert registry.canonicalizer is None, "this registry declares no equivalences"
 
 
 def test_running_with_a_stale_authorization_is_refused() -> None:
@@ -291,3 +305,158 @@ def test_argument_models_that_do_not_round_trip_are_refused_without_echoing_valu
     with pytest.raises(ToolArgumentError, match="canonical") as info:
         registry.validate_call(call("use_token", token="s3cr3t-value"))
     assert "s3cr3t-value" not in str(info.value)
+
+
+# -- the canonical form has to be a fixed point --------------------------------------------------
+
+
+class _Canonicalizer:
+    """A deliberately broken canonicalizer, so the registry's own guard can be observed."""
+
+    def __init__(self, replacement: dict[str, JsonValue]) -> None:
+        self._replacement = replacement
+
+    def normalize(self, tool_name: str, args: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+        del tool_name, args
+        return dict(self._replacement)
+
+
+class TrimmedArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: Annotated[str, AfterValidator(str.strip)]
+
+
+TRIM = ToolDefinition(
+    name="trim",
+    description="Echo trimmed text.",
+    args_model=TrimmedArgs,
+    effect=Effect.PURE,
+    capabilities=frozenset({Capability.COMPUTE}),
+    handler=lambda args: args.text,
+)
+
+
+def _registry_with(canonicalizer: _Canonicalizer, tool: ToolDefinition[Any] = TRIM) -> ToolRegistry:
+    registry = ToolRegistry({Capability.COMPUTE}, canonicalizer=canonicalizer)
+    registry.register(tool)
+    return registry
+
+
+def test_a_canonicalizer_whose_output_fails_the_schema_is_refused() -> None:
+    """The canonical form is what gets hashed *and* executed, so it must still be valid."""
+    registry = _registry_with(_Canonicalizer({"text": 123}))
+    with pytest.raises(ToolArgumentError, match="canonical"):
+        registry.validate_call(call("trim", text="hi"))
+
+
+def test_a_canonicalizer_whose_output_is_not_a_fixed_point_is_refused() -> None:
+    """Two spellings may share a call hash only if they also execute identically.
+
+    ``TrimmedArgs`` strips on validation, so a canonicalizer emitting padded text produces
+    something the model re-serializes differently: the key would say ``" hi "`` while the handler
+    received ``"hi"``, and a second call spelled ``"hi"`` would then be served that branch.
+    """
+    registry = _registry_with(_Canonicalizer({"text": "  hi  "}))
+    with pytest.raises(ToolArgumentError, match="round-trip"):
+        registry.validate_call(call("trim", text="hi"))
+
+
+def test_a_canonicalizer_that_is_a_fixed_point_is_accepted() -> None:
+    """The positive control: the guard refuses broken normalizers, not normalization."""
+    registry = _registry_with(_Canonicalizer({"text": "HI"}))
+    validated = registry.validate_call(call("trim", text="hi"))
+    assert validated.canonical_args == {"text": "HI"}
+    assert validated.run() == "HI"
+
+
+# -- guards that only a dynamically assembled tool can reach --------------------------------------
+
+
+def test_an_effect_that_is_not_an_effect_class_is_refused_at_definition() -> None:
+    """A plain string is the shape a hand-built dict or a loose config would produce."""
+    # Typed as Any on purpose: this is the value a loosely typed caller would hand in.
+    stringly_typed_effect: Any = "read"
+    with pytest.raises(TypeError, match="must declare an effect class"):
+        ToolDefinition(
+            name="stringly_typed",
+            description="x",
+            args_model=EchoArgs,
+            effect=stringly_typed_effect,
+            capabilities=frozenset({Capability.COMPUTE}),
+            handler=echo,
+        )
+
+
+def test_registration_re_checks_the_effect_of_a_tool_assembled_behind_the_constructor() -> None:
+    """``__post_init__`` is not the only way in, so ``register`` checks the effect itself."""
+    smuggled = ToolDefinition(
+        name="smuggled",
+        description="x",
+        args_model=EchoArgs,
+        effect=Effect.PURE,
+        capabilities=frozenset({Capability.COMPUTE}),
+        handler=echo,
+    )
+    object.__setattr__(smuggled, "effect", "pure")
+
+    registry = ToolRegistry({Capability.COMPUTE})
+    with pytest.raises(ToolNotAllowedError, match="did not declare an effect class"):
+        registry.register(smuggled)
+    assert registry.names == ()
+
+
+def test_a_non_positive_freshness_window_is_refused() -> None:
+    for window in (0.0, -1.0):
+        with pytest.raises(ValueError, match="freshness_seconds must be positive"):
+            ToolDefinition(
+                name="stale",
+                description="x",
+                args_model=WriteArgs,
+                effect=Effect.READ,
+                capabilities=frozenset({Capability.READ_DATA}),
+                handler=write,
+                freshness_seconds=window,
+            )
+
+
+def test_negative_expected_latency_or_cost_is_refused() -> None:
+    for latency, cost in ((-0.1, 0.0), (0.0, -0.1)):
+        with pytest.raises(ValueError, match="negative expected latency or cost"):
+            ToolDefinition(
+                name="impossible",
+                description="x",
+                args_model=EchoArgs,
+                effect=Effect.PURE,
+                capabilities=frozenset({Capability.COMPUTE}),
+                handler=echo,
+                expected_latency_seconds=latency,
+                expected_cost_usd=cost,
+            )
+
+
+class SkewedArgs(BaseModel):
+    """An args model whose dump does not re-validate: the shape the round-trip check is for."""
+
+    model_config = ConfigDict(extra="forbid")
+    value: int
+
+    @field_serializer("value")
+    def _as_text(self, value: int) -> str:
+        return str(value)
+
+
+def test_an_args_model_whose_dump_does_not_re_validate_is_refused() -> None:
+    """A lossy serializer would put the handler's input outside the call hash."""
+    registry = ToolRegistry({Capability.COMPUTE})
+    registry.register(
+        ToolDefinition(
+            name="skewed",
+            description="x",
+            args_model=SkewedArgs,
+            effect=Effect.PURE,
+            capabilities=frozenset({Capability.COMPUTE}),
+            handler=lambda args: args.value,
+        )
+    )
+    with pytest.raises(ToolArgumentError, match="round-trip"):
+        registry.validate_call(call("skewed", value=7))
