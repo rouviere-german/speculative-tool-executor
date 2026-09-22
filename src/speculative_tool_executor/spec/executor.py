@@ -38,11 +38,12 @@ from speculative_tool_executor.agentic.providers.base import ToolUseBlock
 from speculative_tool_executor.agentic.tools import ToolRegistry, ValidatedCall
 from speculative_tool_executor.core.canonical import canonical_json, sha256_hex
 from speculative_tool_executor.core.logging import get_logger
-from speculative_tool_executor.spec.cache import SpeculativeCache
+from speculative_tool_executor.spec.cache import SpeculativeCache, SpeculativeResult
 from speculative_tool_executor.spec.clock import Clock
 from speculative_tool_executor.spec.controller import SpeculationController
 from speculative_tool_executor.spec.latency import LatencyModel
 from speculative_tool_executor.spec.metrics import SpeculationMetrics
+from speculative_tool_executor.spec.overlay import BranchState
 from speculative_tool_executor.spec.predictor import NullPredictor, Predictor
 from speculative_tool_executor.spec.runner import ToolRunner
 from speculative_tool_executor.spec.speculator import (
@@ -53,7 +54,7 @@ from speculative_tool_executor.spec.speculator import (
 from speculative_tool_executor.spec.store import VersionedStore
 from speculative_tool_executor.spec.taint import TaintTracker
 
-__all__ = ["ExecutionMode", "SpeculativeToolExecutor", "ToolOutcome"]
+__all__ = ["ExecutionMode", "SpeculativeToolExecutor", "ToolOutcome", "unusable_reason"]
 
 _log = get_logger("speculative_tool_executor.executor")
 
@@ -195,7 +196,8 @@ class SpeculativeToolExecutor:
         mode = ExecutionMode.DIRECT
         conflicts: tuple[str, ...] = ()
         result = self._cache.take(key, now=self._clock.now)
-        if result is not None and result.outcome == "ok":
+        unusable = unusable_reason(result)
+        if result is not None and unusable is None:
             waited = self._clock.now - arrival
             commit = (
                 result.overlay.commit()
@@ -204,7 +206,7 @@ class SpeculativeToolExecutor:
             )
             if commit.committed:
                 saved = max(0.0, result.latency_seconds - waited)
-                session.record_hit(key, saved_seconds=saved)
+                session.record_hit(key, tool=result.tool, saved_seconds=saved)
                 outcome = ToolOutcome(
                     tool=result.tool,
                     call_hash=key,
@@ -226,10 +228,8 @@ class SpeculativeToolExecutor:
                 key, tool=result.tool, cost_usd=result.cost_usd, reason="occ_conflict"
             )
             mode = ExecutionMode.SPECULATIVE_ABORTED
-        elif result is not None:
-            session.record_discard(
-                key, tool=result.tool, cost_usd=result.cost_usd, reason="speculative_error"
-            )
+        elif result is not None and unusable is not None:
+            session.record_discard(key, tool=result.tool, cost_usd=result.cost_usd, reason=unusable)
             mode = ExecutionMode.SPECULATIVE_ABORTED
 
         outcome = await self._execute_directly(
@@ -339,6 +339,26 @@ class SpeculativeToolExecutor:
         if extra:
             data.update(extra)
         self._audit.append(self._principal, action, data)
+
+
+def unusable_reason(result: SpeculativeResult | None) -> str | None:
+    """Why a claimed result must not be served, or None when it may be.
+
+    Two things disqualify it. A handler that raised produced no answer worth serving -- the
+    authoritative call runs for itself and reports its own error. And a branch that is no longer
+    ``OPEN`` has already been settled by something else: committing it again would raise, and
+    treating it as an empty commit would report writes that never reached the store. Neither
+    state is produced by the speculator (``PURE`` results carry no branch, and every other entry
+    leaves the cache when its branch is settled), so this is the fail-closed backstop rather than
+    a path the benchmark takes.
+    """
+    if result is None:
+        return None
+    if result.outcome != "ok":
+        return "speculative_error"
+    if result.overlay is not None and result.overlay.state is not BranchState.OPEN:
+        return "branch_settled"
+    return None
 
 
 def launched_probability(launched: LaunchedSpeculation | None) -> float:

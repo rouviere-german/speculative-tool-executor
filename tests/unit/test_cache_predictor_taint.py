@@ -63,15 +63,56 @@ def result(
 
 
 def test_read_and_write_results_are_single_use_but_pure_results_are_not() -> None:
-    cache = SpeculativeCache()
-    cache.put(result("read", effect=Effect.READ))
-    cache.put(result("pure", effect=Effect.PURE))
+    """Claimed twice, with the branch shapes the speculator actually produces.
 
-    assert cache.take("read", now=0.0) is not None
-    assert cache.take("read", now=0.0) is None, "a read branch is consumed when claimed"
+    A ``READ`` or ``WRITE`` entry carries a real overlay whose read set is validated and then
+    consumed, so it may be handed out once. A ``PURE`` entry carries no branch at all, which is
+    what lets it be handed out again -- see ``test_a_pure_speculation_carries_no_branch_into_the
+    _cache`` in ``tests/unit/test_speculator.py`` for the same shape built by the real session.
+    """
+    with VersionedStore(":memory:", synchronous="OFF") as store:
+        read_branch = WriteOverlay(store=store, branch_id="spec:read", read_only=True)
+        read_branch.read("some/key")
+        write_branch = WriteOverlay(store=store, branch_id="spec:write")
+        write_branch.write("some/key", "v")
 
-    assert cache.take("pure", now=0.0) is not None
-    assert cache.take("pure", now=0.0) is not None, "a pure result depends on nothing else"
+        cache = SpeculativeCache()
+        cache.put(result("read", effect=Effect.READ, overlay=read_branch))
+        cache.put(result("write", effect=Effect.WRITE, overlay=write_branch))
+        cache.put(result("pure", effect=Effect.PURE, overlay=None))
+
+        claimed = cache.take("read", now=0.0)
+        assert claimed is not None
+        assert claimed.overlay is read_branch
+        assert read_branch.commit().committed is True
+        assert cache.take("read", now=0.0) is None, "a read branch is consumed when claimed"
+
+        written = cache.take("write", now=0.0)
+        assert written is not None
+        assert written.overlay is write_branch
+        assert cache.take("write", now=0.0) is None, "a write branch is consumed when claimed"
+
+        first = cache.take("pure", now=0.0)
+        again = cache.take("pure", now=0.0)
+        assert first is not None
+        assert again is not None
+        assert again is first, "a pure result depends on nothing else, so it is reused as-is"
+        assert again.overlay is None, "a reusable entry must not carry a settled branch"
+
+
+def test_a_reusable_result_cannot_be_built_with_a_branch_attached() -> None:
+    """The shape that crashed the second claim of a PURE result is refused at construction.
+
+    A reusable entry is handed out once per matching call, and a branch can only be settled
+    once, so the two cannot be combined. Refusing the shape outright means no future caller can
+    reintroduce the double commit by forgetting to drop the branch.
+    """
+    with VersionedStore(":memory:", synchronous="OFF") as store:
+        branch = WriteOverlay(store=store, branch_id="spec:pure", read_only=True)
+        with pytest.raises(ValueError, match="must not carry a branch"):
+            result("pure", effect=Effect.PURE, overlay=branch)
+        # The single-use effects still take their branch; the rule is about reuse, not effects.
+        assert result("read", effect=Effect.READ, overlay=branch).overlay is branch
 
 
 def test_a_miss_is_a_miss_and_is_counted() -> None:

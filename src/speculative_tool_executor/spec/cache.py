@@ -45,6 +45,12 @@ class SpeculativeResult:
     latency_seconds: float = 0.0
     cost_usd: float = 0.0
 
+    def __post_init__(self) -> None:
+        # A reusable entry is handed out to every matching call, so a branch attached to it
+        # would be committed once per claim -- and a branch can only be settled once.
+        if self.reusable and self.overlay is not None:
+            raise ValueError(f"a reusable ({self.effect.value}) result must not carry a branch")
+
     @property
     def reusable(self) -> bool:
         """Pure results depend on nothing but their arguments, so they survive being claimed."""

@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pydantic import JsonValue
 
 from speculative_tool_executor.agentic.audit import AuditLog
-from speculative_tool_executor.agentic.effects import SPECULATABLE_EFFECTS
+from speculative_tool_executor.agentic.effects import SPECULATABLE_EFFECTS, Effect
 from speculative_tool_executor.agentic.errors import ToolArgumentError, ToolNotAllowedError
 from speculative_tool_executor.agentic.providers.base import ToolUseBlock
 from speculative_tool_executor.agentic.tools import ToolRegistry, ValidatedCall
@@ -281,6 +281,12 @@ class SpeculationSession:
                 launched.done.set()
                 raise
             tool = validated.tool
+            # A PURE handler touches no store state, and its cache entry is *reusable*: the same
+            # result object is handed to every matching call. Carrying the branch into the cache
+            # would mean committing an already-committed overlay on the second claim, so the
+            # branch is dropped here -- which is also what spec/cache.py documents.
+            if tool.effect is Effect.PURE:
+                outcome.overlay.abort()
             self._deps.cache.put(
                 SpeculativeResult(
                     key=launched.key,
@@ -290,7 +296,7 @@ class SpeculationSession:
                     outcome=outcome.outcome,
                     output=outcome.output,
                     error=outcome.error,
-                    overlay=outcome.overlay,
+                    overlay=None if tool.effect is Effect.PURE else outcome.overlay,
                     created_at=outcome.finished_at,
                     expires_at=freshness_deadline(outcome.finished_at, tool.freshness_seconds),
                     latency_seconds=outcome.latency_seconds,
@@ -317,10 +323,14 @@ class SpeculationSession:
         with self._clock.parked():
             await launched.done.wait()
 
-    def record_hit(self, key: str, *, saved_seconds: float) -> None:
-        """A claimed branch committed: charge the saved latency to the tool's statistics."""
-        launched = self._forget(key)
-        tool = launched.tool if launched is not None else "unknown"
+    def record_hit(self, key: str, *, tool: str, saved_seconds: float) -> None:
+        """A claimed branch committed: charge the saved latency to the tool's statistics.
+
+        ``tool`` is passed in rather than read off the launch record, because a reusable
+        (``PURE``) result outlives its launch: the second call that claims it finds nothing left
+        in flight, and crediting a placeholder there would quietly mis-attribute the saving.
+        """
+        self._forget(key)
         controller = self._deps.controller
         controller.record_hit(tool, saved_seconds=saved_seconds)
         metrics = self._deps.metrics

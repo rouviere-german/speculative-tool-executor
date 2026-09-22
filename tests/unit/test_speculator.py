@@ -339,3 +339,75 @@ async def test_refusals_and_launches_are_both_visible_in_metrics(tmp_path) -> No
         assert any('"speculation.launched"' in line for line in actions)
     finally:
         harness.close()
+
+
+# -- a reusable PURE result is claimed more than once ---------------------------------------------
+
+
+async def test_a_pure_speculation_can_be_claimed_twice_without_exploding() -> None:
+    """A PURE result stays in the cache after it is claimed, so the second claim must work.
+
+    ``SpeculativeCache.take`` deliberately keeps a reusable (``PURE``) entry, so the *same*
+    ``SpeculativeResult`` object is handed out again. If that object still carries the branch
+    overlay from its speculation, the second claim commits an already-committed branch and the
+    run dies with ``OverlayError``. A ``PURE`` handler touches no store state, so there is
+    nothing to commit in the first place.
+    """
+    text = "Auth module rotates keys. It also logs failures."
+    harness = Harness(prediction("outline_text", {"text": text}), seen=(text,))
+    call = ToolUseBlock(id="t1", name="outline_text", arguments={"text": text})
+    try:
+        with harness.clock.participant():
+            async with harness.executor.session() as session:
+                session.start_turn(
+                    PredictionContext(history=("read_file(path)",), last_output=LISTING)
+                )
+                await harness.clock.sleep(5.0)
+
+                first = await harness.executor.execute(call, session=session)
+                assert first.mode == "speculative-committed"
+
+                second = await harness.executor.execute(call, session=session)
+                assert second.mode == "speculative-committed"
+                assert second.output == first.output
+    finally:
+        harness.close()
+
+
+async def test_a_pure_speculation_carries_no_branch_into_the_cache() -> None:
+    """``spec/cache.py`` states that PURE results carry no branch; hold the code to it."""
+    text = "Keys rotate nightly. Failures are logged."
+    harness = Harness(prediction("outline_text", {"text": text}), seen=(text,))
+    try:
+        with harness.clock.participant():
+            async with harness.executor.session() as session:
+                session.start_turn(
+                    PredictionContext(history=("read_file(path)",), last_output=LISTING)
+                )
+                await harness.clock.sleep(5.0)
+                stored = [harness.executor.cache.peek(key) for key in harness.executor.cache.keys]
+                assert stored
+                assert all(entry is not None for entry in stored)
+                assert all(entry.overlay is None for entry in stored if entry is not None)
+    finally:
+        harness.close()
+
+
+async def test_a_hit_is_credited_to_the_tool_that_produced_it() -> None:
+    """A second claim has no live ``LaunchedSpeculation`` left; the credit must not go nowhere."""
+    text = "Rotate the signing key. Alert on repeated failures."
+    harness = Harness(prediction("outline_text", {"text": text}), seen=(text,))
+    call = ToolUseBlock(id="t1", name="outline_text", arguments={"text": text})
+    try:
+        with harness.clock.participant():
+            async with harness.executor.session() as session:
+                session.start_turn(
+                    PredictionContext(history=("read_file(path)",), last_output=LISTING)
+                )
+                await harness.clock.sleep(5.0)
+                await harness.executor.execute(call, session=session)
+                await harness.executor.execute(call, session=session)
+        assert harness.controller.tool_stats("outline_text").hits == 2
+        assert harness.controller.tool_stats("unknown").hits == 0
+    finally:
+        harness.close()
