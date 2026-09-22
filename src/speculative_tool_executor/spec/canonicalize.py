@@ -45,7 +45,7 @@ __all__ = [
     "collapse_whitespace",
     "normalize_path",
     "normalize_url",
-    "sorted_unique",
+    "sorted_values",
     "to_lowercase",
 ]
 
@@ -150,14 +150,17 @@ def collapse_whitespace(value: JsonValue) -> JsonValue:
     return _WHITESPACE.sub(" ", value).strip() if isinstance(value, str) else value
 
 
-def sorted_unique(value: JsonValue) -> JsonValue:
-    """Sort and de-duplicate a list argument the tool treats as a set."""
+def sorted_values(value: JsonValue) -> JsonValue:
+    """Sort a list argument whose tool ignores the order of its members but not their number.
+
+    De-duplicating here as well would be sound -- equal keys would still imply equal execution
+    -- but only because the handler would then be unable to observe a duplicate at all. That is
+    a rule that erases part of the tool's input rather than one that describes what the tool
+    ignores, so multiplicity is left alone and a repeated member stays a different call.
+    """
     if not isinstance(value, list):
         return value
-    seen: dict[str, JsonValue] = {}
-    for item in value:
-        seen.setdefault(canonical_json(item), item)
-    return [seen[key] for key in sorted(seen)]
+    return sorted(value, key=canonical_json)
 
 
 @dataclass(frozen=True, slots=True)

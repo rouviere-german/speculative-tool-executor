@@ -86,7 +86,10 @@ def outline_text(text: str) -> dict[str, JsonValue]:
 
 
 def tally_items(items: Sequence[str]) -> dict[str, JsonValue]:
-    """Pure frequency count over an argument the tool treats as a set."""
+    """Pure frequency count: how many members, how many distinct, and the three commonest.
+
+    Order is insignificant (the declared canonicalization sorts), repetition is not.
+    """
     counts: dict[str, int] = {}
     for item in items:
         counts[item] = counts.get(item, 0) + 1

@@ -26,7 +26,7 @@ from speculative_tool_executor.spec.canonicalize import (
     collapse_whitespace,
     normalize_path,
     normalize_url,
-    sorted_unique,
+    sorted_values,
     to_lowercase,
 )
 from speculative_tool_executor.workload.corpus import WorkspaceError, build_corpus
@@ -55,12 +55,16 @@ def test_every_normalizer_is_idempotent(normalizer: object, value: JsonValue) ->
 
 
 @given(items=st.lists(st.text(max_size=5), max_size=8))
-def test_sorted_unique_is_idempotent_and_order_insensitive(items: list[str]) -> None:
+def test_sorted_values_is_idempotent_order_insensitive_and_keeps_multiplicity(
+    items: list[str],
+) -> None:
     values: JsonValue = list(items)
-    once = sorted_unique(values)
-    assert sorted_unique(once) == once
+    once = sorted_values(values)
+    assert sorted_values(once) == once
     reversed_values: JsonValue = list(reversed(items))
-    assert sorted_unique(reversed_values) == once
+    assert sorted_values(reversed_values) == once
+    assert isinstance(once, list)
+    assert sorted(str(item) for item in once) == sorted(items), "no member dropped or added"
 
 
 @given(path=_PATHS, repeats=st.integers(min_value=1, max_value=3))
@@ -145,8 +149,8 @@ def test_tools_without_rules_pass_through_unchanged() -> None:
         ),
         (
             "tally_items",
-            {"items": ["b", "a"]},
-            {"items": ["a", "b", "a"]},
+            {"items": ["b", "a", "a"]},
+            {"items": ["a", "a", "b"]},
         ),
     ],
 )
@@ -164,6 +168,28 @@ def test_equal_keys_imply_equal_execution(
     assert first.call_hash == second.call_hash
     assert first.canonical_args == second.canonical_args
     assert canonical_json(first.run()) == canonical_json(second.run())
+
+
+def test_a_tally_keeps_multiplicity_out_of_its_equivalence_class() -> None:
+    """``tally_items`` counts a multiset: order is insignificant to it, repetition is not.
+
+    De-duplicating in the canonicalizer would make the rule *sound* -- equal keys would still
+    imply equal execution -- by making the handler unable to observe a duplicate at all, which
+    would leave the tool's own frequency count unreachable. So the declared equivalence sorts
+    and nothing more, and a repeated item is a different call with a different key.
+    """
+    registry, _ = build_registry(build_corpus())
+    repeated = registry.validate_call(
+        ToolUseBlock(id="a", name="tally_items", arguments={"items": ["b", "a", "a"]})
+    )
+    distinct = registry.validate_call(
+        ToolUseBlock(id="b", name="tally_items", arguments={"items": ["a", "b"]})
+    )
+
+    assert repeated.canonical_args == {"items": ["a", "a", "b"]}
+    assert repeated.call_hash != distinct.call_hash
+    assert repeated.run() == {"distinct": 2, "total": 3, "top": ["a", "b"]}
+    assert distinct.run() == {"distinct": 2, "total": 2, "top": ["a", "b"]}
 
 
 def test_without_the_declared_rules_an_equivalent_spelling_is_a_different_call() -> None:
@@ -254,7 +280,7 @@ def test_non_string_and_non_list_values_pass_through_every_normalizer() -> None:
         assert normalize_url(value) == value
         assert to_lowercase(value) == value
         assert collapse_whitespace(value) == value
-        assert sorted_unique(value) == value
+        assert sorted_values(value) == value
 
 
 def test_aliases_ignore_values_that_are_not_strings() -> None:

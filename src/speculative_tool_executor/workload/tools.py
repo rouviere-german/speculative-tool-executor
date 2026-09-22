@@ -44,7 +44,7 @@ from speculative_tool_executor.spec.canonicalize import (
     collapse_whitespace,
     normalize_path,
     normalize_url,
-    sorted_unique,
+    sorted_values,
     to_lowercase,
 )
 from speculative_tool_executor.spec.context import current_execution
@@ -184,9 +184,10 @@ def build_canonicalizer() -> ToolArgumentCanonicalizer:
     """The declared equivalences. Each rule is a claim about what its tool ignores.
 
     ``search_code`` lower-cases and collapses whitespace because its handler does; ``tally_items``
-    sorts and de-duplicates because it counts a set; paths and URLs follow the syntax-based rules
-    in :mod:`speculative_tool_executor.spec.canonicalize`. Nothing else is normalized, so any
-    other spelling difference simply misses instead of merging two different calls.
+    sorts but does not de-duplicate, because a frequency count ignores order and not repetition;
+    paths and URLs follow the syntax-based rules in
+    :mod:`speculative_tool_executor.spec.canonicalize`. Nothing else is normalized, so any other
+    spelling difference simply misses instead of merging two different calls.
     """
     return ToolArgumentCanonicalizer(
         {
@@ -200,7 +201,7 @@ def build_canonicalizer() -> ToolArgumentCanonicalizer:
             "save_note": [ArgRule(field="key", normalizers=(normalize_path,))],
             "bump_index": [ArgRule(field="key", normalizers=(normalize_path,))],
             "outline_text": [ArgRule(field="text", normalizers=(collapse_whitespace,))],
-            "tally_items": [ArgRule(field="items", normalizers=(sorted_unique,))],
+            "tally_items": [ArgRule(field="items", normalizers=(sorted_values,))],
         }
     )
 
