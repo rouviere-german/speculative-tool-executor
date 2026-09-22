@@ -14,7 +14,8 @@ that "simulated seconds" and "seconds this took" are never confused.
 
 Thresholds are one-sided on purpose:
 
-- ``min`` entries are floors on things that should stay good (tool-wait reduction, coverage);
+- ``min`` entries are floors on things that should stay good: the end-to-end p50 and p95
+  reductions the README leads with, tool-wait reduction, coverage and hit ratio;
 - ``max`` entries are ceilings on things that should stay small (waste ratio, OCC conflicts) or
   that must stay zero (external speculations, tasks whose output diverged).
 
@@ -354,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.markdown is not None:
         target = args.markdown if args.markdown.is_absolute() else ROOT / args.markdown
-        target.write_text(markdown(payload), encoding="utf-8")
+        target.write_text(markdown(payload), encoding="utf-8", newline="\n")
         print(f"wrote {target.relative_to(ROOT)}")
 
     if args.check:
